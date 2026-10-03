@@ -5,7 +5,8 @@
   "type": "module",
   "exports": "./src/dm.ts",
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
   },
   "dependencies": {
     "@opencode-ai/plugin": "next",
@@ -13,6 +14,7 @@
     "effect": "4.0.0-beta.101"
   },
   "devDependencies": {
-    "@types/node": "^26.2.0"
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2"
   }
 }

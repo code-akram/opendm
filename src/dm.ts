@@ -3,40 +3,51 @@ import { Session } from "@opencode-ai/schema/session"
 import { Tool } from "@opencode-ai/schema/tool"
 import type { SystemPart } from "@opencode-ai/ai"
 import { Effect, Schema } from "effect"
-import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
+import { createRoster } from "./roster.js"
 
-const ROSTER_PATH = path.join(os.homedir(), ".opendm", "roster.json")
+const env = (key: string, fallback: number) => {
+  const value = Number(process.env[key])
+  return Number.isFinite(value) && value > 0 ? value : fallback
+}
 
-type Entry = { id: Session.ID; updatedAt: number }
-type Roster = Record<string, Entry>
-
-const readRoster = Effect.tryPromise(async (): Promise<Roster> => {
-  try {
-    return JSON.parse(await fs.readFile(ROSTER_PATH, "utf8")) as Roster
-  } catch {
-    return {}
-  }
+const roster = createRoster({
+  dir: path.join(os.homedir(), ".opendm"),
+  ttlMs: env("OPENDM_SESSION_TTL_MS", 5 * 60_000),
+  reapMs: env("OPENDM_SESSION_REAP_MS", 60 * 60_000),
+  lockWaitMs: env("OPENDM_LOCK_WAIT_MS", 5_000),
+  lockStaleMs: env("OPENDM_LOCK_STALE_MS", 15_000),
 })
 
-const writeRoster = (roster: Roster) =>
-  Effect.tryPromise(async () => {
-    await fs.mkdir(path.dirname(ROSTER_PATH), { recursive: true })
-    const tmp = `${ROSTER_PATH}.tmp`
-    await fs.writeFile(tmp, JSON.stringify(roster, null, 2))
-    await fs.rename(tmp, ROSTER_PATH)
-  })
+const TOUCH_THROTTLE_MS = env("OPENDM_TOUCH_THROTTLE_MS", 5_000)
 
 const toolError = (message: string) => new Tool.Error({ message })
 
 const DM_PREFIX = "[DM from "
 
+/** `name-ses_ab12…`, so a DM header stays readable in the TUI. */
+const displaySender = (name: string | undefined, sessionID: Session.ID) =>
+  name ? `${name}-${sessionID.slice(0, 12)}…` : sessionID
+
 export default Plugin.define({
   id: "dm",
   effect: (ctx) =>
     Effect.gen(function* () {
+      // Presence: every turn refreshes this session's liveness, which also
+      // revives a roster entry that aged out. Throttled so a fast turn loop
+      // does not rewrite the roster per message, and ignored on failure so it
+      // can never break a turn.
+      const touchedAt = new Map<string, number>()
+      const touch = (sessionID: Session.ID) => {
+        const previous = touchedAt.get(sessionID) ?? 0
+        if (Date.now() - previous < TOUCH_THROTTLE_MS) return
+        touchedAt.set(sessionID, Date.now())
+        roster.touch(sessionID).pipe(Effect.ignore)
+      }
+
       yield* ctx.session.hook("context", (event) => {
+        touch(event.sessionID)
         const last = event.messages.at(-1)
         const meta = last?.role === "user" ? last.metadata : undefined
         const isDm = meta?.dm === true && typeof meta.from === "string"
@@ -61,29 +72,31 @@ export default Plugin.define({
           output: Schema.String,
           options: { codemode: false },
           execute: ({ name }, { sessionID }) =>
-            readRoster.pipe(
-              Effect.map((roster) => {
-                roster[name] = { id: sessionID, updatedAt: Date.now() }
-                return roster
+            roster.register(name, sessionID).pipe(
+              Effect.map(({ displaced }) => {
+                const text =
+                  `registered "${name}" (${sessionID})` +
+                  (displaced ? ` — note: this name was previously bound to ${displaced}` : "")
+                return { output: text, content: text }
               }),
-              Effect.flatMap(writeRoster),
-              Effect.map(() => ({ output: `registered "${name}"`, content: `registered "${name}" (${sessionID})` })),
               Effect.mapError(() => toolError("register failed")),
             ),
         })
 
         tools.add({
           name: "who",
-          description: "List registered sessions (name → session ID)",
+          description: "List registered sessions (name → session ID) and whether each is live",
           input: Schema.Struct({}),
           output: Schema.String,
           options: { codemode: false },
           execute: () =>
-            readRoster.pipe(
-              Effect.map((roster) => {
-                const lines = Object.entries(roster)
-                  .sort((a, b) => b[1].updatedAt - a[1].updatedAt)
-                  .map(([name, entry]) => `${name} → ${entry.id} (${new Date(entry.updatedAt).toISOString()})`)
+            roster.read.pipe(
+              Effect.map((current) => {
+                const now = Date.now()
+                const lines = roster.list(current, now).map(
+                  ({ name, entry, live }) =>
+                    `${name} → ${entry.id} (${live ? "live" : "stale"}, last turn ${new Date(entry.lastSeen).toISOString()})`,
+                )
                 const text = lines.length > 0 ? lines.join("\n") : "no sessions registered"
                 return { output: text, content: text }
               }),
@@ -106,14 +119,34 @@ export default Plugin.define({
           output: Schema.String,
           options: { codemode: false },
           execute: ({ to, content, delivery, message_type, thread_id, priority }, { sessionID }) =>
-            readRoster.pipe(
-              Effect.flatMap((roster) => {
-                const target = roster[to]?.id ?? (to as Session.ID)
-                const senderName = Object.entries(roster).find(([, e]) => e.id === sessionID)?.[0]
-                const sender = senderName ? `${senderName}-${sessionID.slice(0, 12)}…` : sessionID
+            roster.read.pipe(
+              Effect.flatMap((current) => {
+                const now = Date.now()
+                const resolved = roster.resolve(current, to, now)
+
+                if (resolved.kind === "unknown-name") {
+                  const known =
+                    resolved.known.length > 0 ? ` Known: ${resolved.known.join(", ")}.` : ""
+                  return Effect.fail(
+                    toolError(
+                      `no session registered as "${to}".${known} Register it first, or pass a raw session ID starting with ses_.`,
+                    ),
+                  )
+                }
+
+                if (resolved.kind === "stale") {
+                  return Effect.fail(
+                    toolError(
+                      `"${to}" is registered to ${resolved.id} but has been idle for ${Math.round(resolved.idleMs / 1000)}s (limit ${Math.round(roster.ttlMs / 1000)}s). It may be closed — send to the raw session ID if you know it, or ask it to re-register.`,
+                    ),
+                  )
+                }
+
+                const senderName = roster.nameFor(current, sessionID)
+                const sender = displaySender(senderName, sessionID)
                 return ctx.session
                   .prompt({
-                    sessionID: target,
+                    sessionID: resolved.id as Session.ID,
                     text: `${DM_PREFIX}${sender}] ${content}`,
                     metadata: {
                       from: sessionID,
@@ -127,12 +160,17 @@ export default Plugin.define({
                   })
                   .pipe(
                     Effect.map(() => ({
-                      output: "delivered",
-                      content: `delivered to ${to} (${delivery})`,
+                      // "admitted" is the honest claim: prompt() returning means
+                      // the input is durably queued for the target — not that
+                      // the target read it or acted on it.
+                      output: "admitted",
+                      content: `admitted to ${senderName ? `"${senderName}"` : to} (${resolved.id}, ${delivery}) — delivery receipt, not a read receipt`,
                     })),
                   )
               }),
-              Effect.mapError(() => toolError(`delivery failed to ${to}`)),
+              Effect.mapError((error) =>
+                error instanceof Tool.Error ? error : toolError(`delivery failed to ${to}`),
+              ),
             ),
         })
       })
