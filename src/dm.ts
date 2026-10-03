@@ -42,10 +42,10 @@ export default Plugin.define({
         tools.add({
           name: "register",
           description: "Register this session under a friendly name, linked to its session ID",
-          input: Schema.Struct({ name: Schema.String }),
-          output: Schema.String,
+          input: { type: "object", properties: { name: { type: "string" } }, required: ["name"], additionalProperties: false },
+          output: { type: "string" },
           options: { codemode: false },
-          execute: ({ name }, { sessionID }) =>
+          execute: ({ name }: any, { sessionID }) =>
             roster.register(name, sessionID).pipe(
               Effect.map(({ displaced }) => {
                 const text =
@@ -60,10 +60,10 @@ export default Plugin.define({
         tools.add({
           name: "who",
           description: "List registered sessions (name → session ID, most recently registered first)",
-          input: Schema.Struct({}),
-          output: Schema.String,
+          input: { type: "object", properties: {}, additionalProperties: false },
+          output: { type: "string" },
           options: { codemode: false },
-          execute: () =>
+          execute: (_input: any) =>
             roster.read.pipe(
               Effect.map((current) => {
                 const lines = roster.list(current).map(
@@ -81,17 +81,22 @@ export default Plugin.define({
           name: "dm",
           description:
             "DM another session by registered name or raw session ID. delivery: steer = interrupt the receiver now, queue = deliver on its next turn. message_type: task, question, status, or review — the receiver decides whether to reply. thread_id groups a conversation (max 64 chars). priority: urgent, normal, or low.",
-          input: Schema.Struct({
-            to: Schema.String,
-            content: Schema.String,
-            delivery: Schema.Literals(["steer", "queue"]),
-            message_type: Schema.optional(Schema.Literals(["task", "question", "status", "review"])),
-            thread_id: Schema.optional(Schema.String),
-            priority: Schema.optional(Schema.Literals(["urgent", "normal", "low"])),
-          }),
-          output: Schema.String,
+          input: {
+            type: "object",
+            properties: {
+              to: { type: "string" },
+              content: { type: "string" },
+              delivery: { type: "string", enum: ["steer", "queue"] },
+              message_type: { type: "string", enum: ["task", "question", "status", "review"] },
+              thread_id: { type: "string" },
+              priority: { type: "string", enum: ["urgent", "normal", "low"] },
+            },
+            required: ["to", "content", "delivery"],
+            additionalProperties: false,
+          },
+          output: { type: "string" },
           options: { codemode: false },
-          execute: ({ to, content, delivery, message_type, thread_id, priority }, { sessionID }) =>
+          execute: ({ to, content, delivery, message_type, thread_id, priority }: any, { sessionID }) =>
             roster.read.pipe(
               Effect.flatMap((current) => {
                 const resolved = roster.resolve(current, to)

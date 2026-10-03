@@ -6,14 +6,28 @@ Sessions register a friendly name, discover each other, and DM back and forth �
 
 ## Install
 
+Point the config at the **package directory**, not a file:
+
 ```jsonc
 // ~/.config/opencode/opencode.json
 {
-  "plugins": ["/path/to/opendm/src/dm.ts"]
+  "plugins": ["/path/to/opendm"]
 }
 ```
 
-Dependencies: `@opencode-ai/plugin@next`, `@opencode-ai/schema@next`, `effect` — install in the plugin's `package.json` (`bun install`). Restart or reload the service after changing the plugin.
+Then restart the service (`opencode service restart`) — plugins are resolved at server startup, and `opencode reload` refreshes config without re-importing them.
+
+The loader resolves a plugin directory to `<dir>/index.ts`. It does **not** consult `package.json` `exports`, so the root `index.ts` re-export is what makes the package loadable; without it the plugin is skipped silently, with no warning. Confirm a load with:
+
+```bash
+opencode run --standalone --print-logs --log-level debug "hi" 2>&1 | grep "loading plugin"
+```
+
+Dependencies: `@opencode-ai/plugin@next`, `@opencode-ai/schema@next`, `effect`. Run `bun install` in this directory first.
+
+### Tool schemas are JSON Schema
+
+Tool `input`/`output` are plain JSON Schema objects, not Effect `Schema` values. The type union (`Tool.ValueSchema`) accepts either, so this is not caught by the compiler — but the server cannot consume Effect's `StandardSchemaV1` and answers `root: Expected object` at call time, even for a well-formed argument object. `tests/plugin.test.ts` guards this.
 
 ## Tools
 

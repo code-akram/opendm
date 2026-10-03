@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "exports": "./src/dm.ts",
+  "exports": "./index.ts",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "bun test"
