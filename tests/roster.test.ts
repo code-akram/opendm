@@ -7,7 +7,7 @@ import { createRoster, normalize } from "../src/roster.js"
 
 const run = <A>(effect: Effect.Effect<A, unknown>) => Effect.runPromise(effect as Effect.Effect<A>)
 
-const tmpRoster = async (options: Parameters<typeof createRoster>[0] extends infer T ? Partial<T> : never = {}) => {
+const tmpRoster = async (options: Partial<Parameters<typeof createRoster>[0]> = {}) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opendm-test-"))
   const store = createRoster({ dir, ...options })
   return { dir, store, cleanup: () => fs.rm(dir, { recursive: true, force: true }) }
@@ -15,18 +15,26 @@ const tmpRoster = async (options: Parameters<typeof createRoster>[0] extends inf
 
 describe("normalize", () => {
   test("accepts the pre-presence { id, updatedAt } shape", () => {
-    const roster = normalize({ planner: { id: "ses_a", updatedAt: 1000 } })
-    expect(roster.planner).toEqual({ id: "ses_a", lastSeen: 1000, registeredAt: 1000 })
+    expect(normalize({ planner: { id: "ses_a", updatedAt: 1000 } })).toEqual({
+      planner: { id: "ses_a", registeredAt: 1000 },
+    })
+  })
+
+  test("accepts a roster that carried a lastSeen field", () => {
+    expect(normalize({ planner: { id: "ses_a", lastSeen: 50, registeredAt: 10 } })).toEqual({
+      planner: { id: "ses_a", registeredAt: 10 },
+    })
   })
 
   test("keeps current shape intact", () => {
-    const roster = normalize({ planner: { id: "ses_a", lastSeen: 50, registeredAt: 10 } })
-    expect(roster.planner).toEqual({ id: "ses_a", lastSeen: 50, registeredAt: 10 })
+    expect(normalize({ planner: { id: "ses_a", registeredAt: 10 } })).toEqual({
+      planner: { id: "ses_a", registeredAt: 10 },
+    })
   })
 
   test("skips malformed entries instead of throwing", () => {
     expect(normalize({ a: { id: "ses_a" }, b: null, c: "nope", d: { id: 7 } })).toEqual({
-      a: { id: "ses_a", lastSeen: 0, registeredAt: 0 },
+      a: { id: "ses_a", registeredAt: 0 },
     })
   })
 
@@ -42,7 +50,8 @@ describe("concurrent writes", () => {
     const { store, cleanup } = await tmpRoster()
     try {
       // The bug this guards: each writer read the same snapshot, so the last
-      // write erased every earlier registration.
+      // write erased every earlier registration. Unlocked, 25 of these
+      // collapse to a single surviving entry.
       await Promise.all(
         Array.from({ length: 25 }, (_, i) => run(store.register(`session-${i}`, `ses_${i}`))),
       )
@@ -56,20 +65,16 @@ describe("concurrent writes", () => {
     }
   })
 
-  test("interleaved registers and touches keep every name bound correctly", async () => {
+  test("repeated rounds of parallel writes stay consistent", async () => {
     const { store, cleanup } = await tmpRoster()
     try {
-      await Promise.all([
-        run(store.register("planner", "ses_p")),
-        run(store.register("backend", "ses_b")),
-        run(store.touch("ses_p")),
-        run(store.touch("ses_b")),
-        run(store.register("tests", "ses_t")),
-      ])
+      for (let round = 0; round < 5; round++) {
+        await Promise.all(
+          Array.from({ length: 10 }, (_, i) => run(store.register(`r${round}-s${i}`, `ses_${round}_${i}`))),
+        )
+      }
       const roster = await run(store.read)
-      expect(roster.planner?.id).toBe("ses_p")
-      expect(roster.backend?.id).toBe("ses_b")
-      expect(roster.tests?.id).toBe("ses_t")
+      expect(Object.keys(roster)).toHaveLength(50)
     } finally {
       await cleanup()
     }
@@ -101,46 +106,36 @@ describe("concurrent writes", () => {
       await cleanup()
     }
   })
+
+  test("leaves no temp files behind", async () => {
+    const { store, dir, cleanup } = await tmpRoster()
+    try {
+      await Promise.all(Array.from({ length: 10 }, (_, i) => run(store.register(`s${i}`, `ses_${i}`))))
+      const files = await fs.readdir(dir)
+      expect(files.filter((f) => f.endsWith(".tmp"))).toEqual([])
+    } finally {
+      await cleanup()
+    }
+  })
 })
 
-describe("presence", () => {
-  test("touch refreshes lastSeen for a registered session", async () => {
-    const { store, cleanup } = await tmpRoster({ ttlMs: 50 })
-    try {
-      await run(store.register("planner", "ses_p"))
-      await new Promise((r) => setTimeout(r, 80))
-      expect((await run(store.read)).planner?.lastSeen).toBeLessThan(Date.now())
-      await run(store.touch("ses_p"))
-      const roster = await run(store.read)
-      expect(roster.planner?.lastSeen).toBeGreaterThan(Date.now() - 50)
-    } finally {
-      await cleanup()
-    }
-  })
-
-  test("touch revives an entry that aged out", async () => {
-    const { store, cleanup } = await tmpRoster({ ttlMs: 40, reapMs: 60 * 60_000 })
-    try {
-      await run(store.register("planner", "ses_p"))
-      await new Promise((r) => setTimeout(r, 70))
-      expect(store.resolve(await run(store.read), "planner", Date.now()).kind).toBe("stale")
-      await run(store.touch("ses_p"))
-      expect(store.resolve(await run(store.read), "planner", Date.now()).kind).toBe("ok")
-    } finally {
-      await cleanup()
-    }
-  })
-
-  test("reap drops entries older than reapMs", async () => {
+describe("persistence", () => {
+  test("entries survive a fresh store over the same directory", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opendm-test-"))
     try {
-      const store = createRoster({ dir, ttlMs: 10, reapMs: 50 })
-      await run(store.register("ancient", "ses_a"))
-      await new Promise((r) => setTimeout(r, 90))
-      await run(store.register("fresh", "ses_f"))
-      const roster = await run(store.read)
-      expect(roster.ancient).toBeUndefined()
-      expect(roster.fresh).toBeDefined()
+      await run(createRoster({ dir }).register("planner", "ses_p"))
+      const reopened = await run(createRoster({ dir }).read)
+      expect(reopened.planner?.id).toBe("ses_p")
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("a corrupt roster file degrades to empty instead of throwing", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opendm-test-"))
+    try {
+      await fs.writeFile(path.join(dir, "roster.json"), "{ not json")
+      expect(await run(createRoster({ dir }).read)).toEqual({})
     } finally {
       await fs.rm(dir, { recursive: true, force: true })
     }
@@ -148,48 +143,37 @@ describe("presence", () => {
 })
 
 describe("resolve", () => {
-  const rosterAt = (now: number) => ({
-    live: { id: "ses_live", lastSeen: now, registeredAt: 0 },
-    dead: { id: "ses_dead", lastSeen: now - 10_000, registeredAt: 0 },
-  })
+  const rosterOf = (entries: Record<string, { id: string; registeredAt: number }>) => entries as never
 
-  test("resolves a live name", async () => {
-    const { store, cleanup } = await tmpRoster({ ttlMs: 5_000 })
-    try {
-      const now = Date.now()
-      const result = store.resolve(rosterAt(now) as never, "live", now)
-      expect(result).toEqual({ kind: "ok", id: "ses_live", name: "live" })
-    } finally {
-      await cleanup()
-    }
-  })
-
-  test("reports a stale name instead of delivering to it", () => {
-    const now = Date.now()
-    const result = createRoster({ dir: "/tmp/unused", ttlMs: 5_000 }).resolve(
-      rosterAt(now) as never,
-      "dead",
-      now,
-    )
-    expect(result.kind).toBe("stale")
-    expect(result.kind === "stale" && result.id).toBe("ses_dead")
+  test("resolves a registered name", () => {
+    const result = createRoster({ dir: "/tmp/unused" }).resolve(rosterOf({ planner: { id: "ses_p", registeredAt: 0 } }), "planner")
+    expect(result).toEqual({ kind: "ok", id: "ses_p", name: "planner" })
   })
 
   test("accepts a raw session id", () => {
-    const result = createRoster({ dir: "/tmp/unused" }).resolve({} as never, "ses_whatever", Date.now())
-    expect(result).toEqual({ kind: "ok", id: "ses_whatever" })
+    expect(createRoster({ dir: "/tmp/unused" }).resolve({} as never, "ses_whatever")).toEqual({
+      kind: "ok",
+      id: "ses_whatever",
+    })
   })
 
   test("rejects an unknown name rather than casting it to a session id", () => {
     // This is the "ghost name" bug: a typo used to be sent as a session id
     // and reported as a successful delivery.
-    const now = Date.now()
-    const result = createRoster({ dir: "/tmp/unused" }).resolve(
-      { planner: { id: "ses_p", lastSeen: now, registeredAt: 0 } } as never,
-      "planer",
-      now,
-    )
-    expect(result).toEqual({ kind: "unknown-name", known: ["planner"] })
+    expect(
+      createRoster({ dir: "/tmp/unused" }).resolve(
+        rosterOf({ planner: { id: "ses_p", registeredAt: 0 } }),
+        "planer",
+      ),
+    ).toEqual({ kind: "unknown-name", known: ["planner"] })
+  })
+
+  test("a name registered long ago still resolves", () => {
+    // No TTL: the inbox is durable, so a dormant session can still receive.
+    const ancient = { id: "ses_old", registeredAt: 0 }
+    expect(
+      createRoster({ dir: "/tmp/unused" }).resolve(rosterOf({ ancient }), "ancient"),
+    ).toEqual({ kind: "ok", id: "ses_old", name: "ancient" })
   })
 })
 
@@ -217,13 +201,39 @@ describe("register", () => {
     }
   })
 
-  test("re-registering preserves original registeredAt", async () => {
+  test("re-registering preserves the original registeredAt", async () => {
     const { store, cleanup } = await tmpRoster()
     try {
       await run(store.register("planner", "ses_p"))
       const before = (await run(store.read)).planner?.registeredAt
       await run(store.register("planner", "ses_p"))
       expect((await run(store.read)).planner?.registeredAt).toBe(before)
+    } finally {
+      await cleanup()
+    }
+  })
+
+  test("two sessions can both be registered under different names", async () => {
+    const { store, cleanup } = await tmpRoster()
+    try {
+      await Promise.all([run(store.register("planner", "ses_p")), run(store.register("backend", "ses_b"))])
+      const roster = await run(store.read)
+      expect(roster.planner?.id).toBe("ses_p")
+      expect(roster.backend?.id).toBe("ses_b")
+    } finally {
+      await cleanup()
+    }
+  })
+})
+
+describe("nameFor", () => {
+  test("finds the name bound to a session id", async () => {
+    const { store, cleanup } = await tmpRoster()
+    try {
+      await run(store.register("planner", "ses_p"))
+      const roster = await run(store.read)
+      expect(store.nameFor(roster, "ses_p")).toBe("planner")
+      expect(store.nameFor(roster, "ses_unknown")).toBeUndefined()
     } finally {
       await cleanup()
     }

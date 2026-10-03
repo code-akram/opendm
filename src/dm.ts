@@ -7,20 +7,7 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { createRoster } from "./roster.js"
 
-const env = (key: string, fallback: number) => {
-  const value = Number(process.env[key])
-  return Number.isFinite(value) && value > 0 ? value : fallback
-}
-
-const roster = createRoster({
-  dir: path.join(os.homedir(), ".opendm"),
-  ttlMs: env("OPENDM_SESSION_TTL_MS", 5 * 60_000),
-  reapMs: env("OPENDM_SESSION_REAP_MS", 60 * 60_000),
-  lockWaitMs: env("OPENDM_LOCK_WAIT_MS", 5_000),
-  lockStaleMs: env("OPENDM_LOCK_STALE_MS", 15_000),
-})
-
-const TOUCH_THROTTLE_MS = env("OPENDM_TOUCH_THROTTLE_MS", 5_000)
+const roster = createRoster({ dir: path.join(os.homedir(), ".opendm") })
 
 const toolError = (message: string) => new Tool.Error({ message })
 
@@ -34,20 +21,7 @@ export default Plugin.define({
   id: "dm",
   effect: (ctx) =>
     Effect.gen(function* () {
-      // Presence: every turn refreshes this session's liveness, which also
-      // revives a roster entry that aged out. Throttled so a fast turn loop
-      // does not rewrite the roster per message, and ignored on failure so it
-      // can never break a turn.
-      const touchedAt = new Map<string, number>()
-      const touch = (sessionID: Session.ID) => {
-        const previous = touchedAt.get(sessionID) ?? 0
-        if (Date.now() - previous < TOUCH_THROTTLE_MS) return
-        touchedAt.set(sessionID, Date.now())
-        roster.touch(sessionID).pipe(Effect.ignore)
-      }
-
       yield* ctx.session.hook("context", (event) => {
-        touch(event.sessionID)
         const last = event.messages.at(-1)
         const meta = last?.role === "user" ? last.metadata : undefined
         const isDm = meta?.dm === true && typeof meta.from === "string"
@@ -85,17 +59,16 @@ export default Plugin.define({
 
         tools.add({
           name: "who",
-          description: "List registered sessions (name → session ID) and whether each is live",
+          description: "List registered sessions (name → session ID, most recently registered first)",
           input: Schema.Struct({}),
           output: Schema.String,
           options: { codemode: false },
           execute: () =>
             roster.read.pipe(
               Effect.map((current) => {
-                const now = Date.now()
-                const lines = roster.list(current, now).map(
-                  ({ name, entry, live }) =>
-                    `${name} → ${entry.id} (${live ? "live" : "stale"}, last turn ${new Date(entry.lastSeen).toISOString()})`,
+                const lines = roster.list(current).map(
+                  ({ name, entry }) =>
+                    `${name} → ${entry.id} (registered ${new Date(entry.registeredAt).toISOString()})`,
                 )
                 const text = lines.length > 0 ? lines.join("\n") : "no sessions registered"
                 return { output: text, content: text }
@@ -121,8 +94,7 @@ export default Plugin.define({
           execute: ({ to, content, delivery, message_type, thread_id, priority }, { sessionID }) =>
             roster.read.pipe(
               Effect.flatMap((current) => {
-                const now = Date.now()
-                const resolved = roster.resolve(current, to, now)
+                const resolved = roster.resolve(current, to)
 
                 if (resolved.kind === "unknown-name") {
                   const known =
@@ -130,14 +102,6 @@ export default Plugin.define({
                   return Effect.fail(
                     toolError(
                       `no session registered as "${to}".${known} Register it first, or pass a raw session ID starting with ses_.`,
-                    ),
-                  )
-                }
-
-                if (resolved.kind === "stale") {
-                  return Effect.fail(
-                    toolError(
-                      `"${to}" is registered to ${resolved.id} but has been idle for ${Math.round(resolved.idleMs / 1000)}s (limit ${Math.round(roster.ttlMs / 1000)}s). It may be closed — send to the raw session ID if you know it, or ask it to re-register.`,
                     ),
                   )
                 }
